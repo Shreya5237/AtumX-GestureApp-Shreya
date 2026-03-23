@@ -16,7 +16,7 @@ const AppContext = createContext(null);
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
-const createEmptyClass = (index) => ({
+const createEmptyClass = (index: number) => ({
   id: uid(),
   name: `Class ${index + 1}`,
   samples: [],
@@ -26,7 +26,7 @@ function clamp01(n) {
   return Math.max(0, Math.min(1, n));
 }
 
-function safeNumber(v, fallback) {
+function safeNumber(v: string, fallback: number) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 }
@@ -81,14 +81,36 @@ function argMax(values) {
   return maxIdx;
 }
 
+function extractAverageColor(video) {
+  if (!video) return null;
+  const canvas = document.createElement("canvas");
+  const size = 20; // Analyze center 20x20 pixels
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  const sx = (video.videoWidth - size) / 2;
+  const sy = (video.videoHeight - size) / 2;
+  ctx.drawImage(video, sx, sy, size, size, 0, 0, size, size);
+  const data = ctx.getImageData(0, 0, size, size).data;
+  let r = 0, g = 0, b = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    r += data[i]; g += data[i + 1]; b += data[i + 2];
+  }
+  const count = data.length / 4;
+  return [r / count / 255, g / count / 255, b / count / 255]; // Normalize 0-1
+}
+
 function useApp() {
   return useContext(AppContext);
 }
 
 function AppProvider({ children }) {
-  const handposeModelRef = useRef(null);
+  const handposeModelRef = useRef<handpose.HandPose | null>(null);
   const [modelLoading, setModelLoading] = useState(true);
   const [modelError, setModelError] = useState("");
+
+  // ✅ FIX: cameraOn state moved inside AppProvider (was outside component before)
+  const [cameraOn, setCameraOn] = useState(false);
 
   const [classes, setClasses] = useState([]);
   const [datasetVersion, setDatasetVersion] = useState(0);
@@ -187,111 +209,131 @@ function AppProvider({ children }) {
     setTrainingStatus(advancedMode ? "Training Neural Network..." : "Preparing KNN model...");
 
     try {
-      const activeClasses = classes.filter((cls) => cls.samples.length > 0);
+      // Filter empty classes
+      const activeClasses = classes.filter(c => c.samples.length > 0);
       const labelMap = activeClasses.map((cls) => ({ id: cls.id, name: cls.name }));
-
-      if (!activeClasses.length) {
-        setTrainingStatus("No usable samples found");
-        return;
-      }
+      
+      // --- Prepare Hand Model Data (Feature len 63) ---
+      let handModel = null;
+      let colorModel = null;
+      let totalHandSamples = 0;
+      let totalColorSamples = 0;
 
       if (!advancedMode) {
-        const knnData = [];
+        // --- KNN MODE ---
+        const handKnnData = [];
+        const colorKnnData = [];
+
         for (const cls of activeClasses) {
           for (const sample of cls.samples) {
             if (sample.features?.length === 63) {
-              knnData.push({
-                classId: cls.id,
-                className: cls.name,
-                features: sample.features,
-              });
+              handKnnData.push({ classId: cls.id, className: cls.name, features: sample.features });
+            } else if (sample.features?.length === 3) {
+              colorKnnData.push({ classId: cls.id, className: cls.name, features: sample.features });
             }
           }
         }
 
-        if (!knnData.length) {
-          setTrainingStatus("No valid 63-length feature vectors found");
-          return;
+        if (handKnnData.length > 0) {
+          handModel = { type: 'knn', data: handKnnData };
+          totalHandSamples = handKnnData.length;
+        }
+        if (colorKnnData.length > 0) {
+          colorModel = { type: 'knn', data: colorKnnData };
+          totalColorSamples = colorKnnData.length;
         }
 
-        setTrainedModel({
-          mode: "basic",
-          kind: "knn",
-          labelMap,
-          knnData,
-          tfModel: null,
-        });
-        setTrainedRevision(datasetVersion);
-        setLastTrainSummary({
-          mode: "basic",
-          samples: knnData.length,
-          classes: activeClasses.length,
-        });
-        setTrainingStatus(`KNN ready ✅ | ${knnData.length} samples across ${activeClasses.length} classes`);
-        return;
+      } else {
+        // --- NN MODE ---
+        
+        // Helper to train a model
+        const trainNN = async (inputSize, getSamples) => {
+            const xs = [];
+            const ys = [];
+            activeClasses.forEach((cls, idx) => {
+                cls.samples.forEach(s => {
+                    if (s.features?.length === inputSize) {
+                        xs.push(s.features);
+                        ys.push(idx);
+                    }
+                });
+            });
+            
+            if (xs.length === 0) return { model: null, count: 0 };
+
+            const xTensor = tf.tensor2d(xs);
+            const yTensor = tf.oneHot(tf.tensor1d(ys, "int32"), activeClasses.length);
+            
+            const model = tf.sequential();
+            // Larger architecture for hands (63 inputs), smaller for colors (3 inputs)
+            if (inputSize === 63) {
+                model.add(tf.layers.dense({ inputShape: [63], units: 128, activation: "relu" }));
+                model.add(tf.layers.dense({ units: 64, activation: "relu" }));
+            } else {
+                model.add(tf.layers.dense({ inputShape: [3], units: 16, activation: "relu" }));
+            }
+            model.add(tf.layers.dense({ units: activeClasses.length, activation: "softmax" }));
+
+            model.compile({
+                optimizer: tf.train.adam(learningRate),
+                loss: "categoricalCrossentropy",
+                metrics: ["accuracy"]
+            });
+
+            await model.fit(xTensor, yTensor, {
+                epochs,
+                batchSize,
+                shuffle: true,
+                callbacks: {
+                   onEpochEnd: (epoch, logs) => {
+                       // Only show logs for hand training to avoid spam, or last one
+                       if (inputSize === 63) {
+                         const loss = logs?.loss != null ? logs.loss.toFixed(4) : "-";
+                         setTrainingStatus(`Epoch ${epoch + 1}/${epochs} | loss: ${loss}`);
+                       }
+                   }
+                }
+            });
+            
+            xTensor.dispose();
+            yTensor.dispose();
+            return { model, count: xs.length };
+        };
+
+        // Train Hand Model
+        const handRes = await trainNN(63);
+        if (handRes.model) {
+            handModel = { type: 'nn', model: handRes.model };
+            totalHandSamples = handRes.count;
+        }
+
+        // Train Color Model
+        const colorRes = await trainNN(3);
+        if (colorRes.model) {
+            colorModel = { type: 'nn', model: colorRes.model };
+            totalColorSamples = colorRes.count;
+        }
       }
 
-      const xs = [];
-      const ys = [];
-
-      activeClasses.forEach((cls, classIndex) => {
-        cls.samples.forEach((sample) => {
-          if (sample.features?.length === 63) {
-            xs.push(sample.features);
-            ys.push(classIndex);
-          }
-        });
-      });
-
-      if (!xs.length) {
-        setTrainingStatus("No valid samples available for training");
+      if (!handModel && !colorModel) {
+        setTrainingStatus("No valid samples (Hand or Color) found");
         return;
       }
-
-      const xTensor = tf.tensor2d(xs);
-      const yTensor = tf.oneHot(tf.tensor1d(ys, "int32"), activeClasses.length);
-
-      const model = tf.sequential();
-      model.add(tf.layers.dense({ inputShape: [63], units: 128, activation: "relu" }));
-      model.add(tf.layers.dense({ units: 64, activation: "relu" }));
-      model.add(tf.layers.dense({ units: activeClasses.length, activation: "softmax" }));
-
-      model.compile({
-        optimizer: tf.train.adam(learningRate),
-        loss: "categoricalCrossentropy",
-        metrics: ["accuracy"],
-      });
-
-      await model.fit(xTensor, yTensor, {
-        epochs,
-        batchSize,
-        shuffle: true,
-        callbacks: {
-          onEpochEnd: (epoch, logs) => {
-            const loss = logs?.loss != null ? logs.loss.toFixed(4) : "-";
-            const acc = logs?.acc != null ? ` | acc: ${(logs.acc * 100).toFixed(1)}%` : "";
-            setTrainingStatus(`Epoch ${epoch + 1}/${epochs} | loss: ${loss}${acc}`);
-          },
-        },
-      });
-
-      xTensor.dispose();
-      yTensor.dispose();
 
       setTrainedModel({
-        mode: "advanced",
-        kind: "nn",
+        mode: advancedMode ? "advanced" : "basic",
         labelMap,
-        knnData: null,
-        tfModel: model,
+        hand: handModel,
+        color: colorModel
       });
       setTrainedRevision(datasetVersion);
       setLastTrainSummary({
-        mode: "advanced",
-        samples: xs.length,
+        mode: advancedMode ? "advanced" : "basic",
+        samples: totalHandSamples + totalColorSamples,
         classes: activeClasses.length,
       });
-      setTrainingStatus(`Neural network ready ✅ | ${xs.length} samples across ${activeClasses.length} classes`);
+      setTrainingStatus(`Ready ✅ | Hand: ${totalHandSamples}, Color: ${totalColorSamples} samples`);
+      
     } catch (err) {
       setTrainingStatus(err?.message || "Training failed");
     } finally {
@@ -306,6 +348,7 @@ function AppProvider({ children }) {
     setTrainedRevision(-1);
     setLastTrainSummary(null);
     setTrainingStatus("Not trained");
+    setCameraOn(false);
   }, []);
 
   const value = useMemo(
@@ -338,12 +381,16 @@ function AppProvider({ children }) {
       resetAll,
       markDatasetDirty,
       setClasses,
+      // ✅ FIX: expose cameraOn and setCameraOn via context
+      cameraOn,
+      setCameraOn,
     }),
     [
       addClass,
       addSampleToClass,
       advancedMode,
       batchSize,
+      cameraOn,
       classes,
       datasetVersion,
       deleteClass,
@@ -368,26 +415,42 @@ function AppProvider({ children }) {
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
 
-function useHandTracking(videoEl, onResults) {
+function useHandTracking(videoEl, onResults, enabled = true) {
   const { handposeModelRef, modelLoading } = useApp();
   const onResultsRef = useRef(onResults);
+  const streamRef = useRef(null);
+
   useEffect(() => {
     onResultsRef.current = onResults;
   }, [onResults]);
 
   useEffect(() => {
-    if (modelLoading || !handposeModelRef.current || !videoEl) return undefined;
+    if (!enabled) {
+      // ✅ FIX: stop camera stream when disabled
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+      if (videoEl) {
+        videoEl.srcObject = null;
+      }
+      return;
+    }
+
+    if (modelLoading || !handposeModelRef.current || !videoEl) return;
 
     let active = true;
     let rafId = 0;
-    let stream = null;
 
     const start = async () => {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
+        const stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: "user" },
           audio: false,
         });
+
+        streamRef.current = stream;
+
         if (!active || !videoEl) return;
 
         videoEl.srcObject = stream;
@@ -395,6 +458,7 @@ function useHandTracking(videoEl, onResults) {
 
         const detect = async () => {
           if (!active || !videoEl || !handposeModelRef.current) return;
+
           try {
             if (videoEl.readyState >= 2) {
               const predictions = await handposeModelRef.current.estimateHands(videoEl, true);
@@ -403,6 +467,7 @@ function useHandTracking(videoEl, onResults) {
           } catch {
             onResultsRef.current([]);
           }
+
           rafId = requestAnimationFrame(detect);
         };
 
@@ -417,32 +482,50 @@ function useHandTracking(videoEl, onResults) {
     return () => {
       active = false;
       cancelAnimationFrame(rafId);
-      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
     };
-  }, [handposeModelRef, modelLoading, videoEl]);
+  }, [handposeModelRef, modelLoading, videoEl, enabled]);
 }
 
 function usePredictionEngine() {
   const { trainedModel } = useApp();
 
   const predict = useCallback(
-    (landmarks) => {
-      if (!trainedModel || !landmarks?.length) return { className: "", confidence: 0 };
+    (landmarks, videoElement) => {
+      if (!trainedModel) return { className: "", confidence: 0, type: "none" };
 
-      const features = vectorizeLandmarks(landmarks);
-      if (!features || features.length !== 63) return { className: "", confidence: 0 };
+      // DECIDE: Hand or Color?
+      // If landmarks exist -> Hand Model. Else if videoElement -> Color Model.
+      let features = null;
+      let activeModel = null;
+      let type = "none";
 
-      if (trainedModel.kind === "knn") {
-        const k = Math.min(3, trainedModel.knnData.length);
-        const scored = trainedModel.knnData
+      if (landmarks && trainedModel.hand) {
+          features = vectorizeLandmarks(landmarks); // returns 63 length array
+          activeModel = trainedModel.hand;
+          type = "hand";
+      } else if (videoElement && trainedModel.color) {
+          features = extractAverageColor(videoElement); // returns 3 length array
+          activeModel = trainedModel.color;
+          type = "color";
+      }
+
+      if (!features || !activeModel) return { className: "", confidence: 0, type: "none" };
+
+      // --- KNN PREDICTION ---
+      if (activeModel.type === 'knn') {
+        const k = Math.min(3, activeModel.data.length);
+        const scored = activeModel.data
           .map((row) => {
             const distance = Math.sqrt(
               row.features.reduce((sum, val, i) => sum + (val - features[i]) ** 2, 0)
             );
             return { classId: row.classId, className: row.className, distance };
           })
-          .sort((a, b) => a.distance - b.distance)
-          .slice(0, k);
+          .sort((a, b) => a.distance - b.distance).slice(0, k);
 
         const votes = {};
         scored.forEach((item) => {
@@ -450,7 +533,6 @@ function usePredictionEngine() {
           votes[item.classId].count += 1;
           votes[item.classId].dist += item.distance;
         });
-
         const best = Object.entries(votes).sort((a, b) => {
           if (b[1].count !== a[1].count) return b[1].count - a[1].count;
           return a[1].dist - b[1].dist;
@@ -459,19 +541,20 @@ function usePredictionEngine() {
         const confidence = best ? (best[1].count / k) * 100 : 0;
         return { className: best ? best[1].className : "", confidence: Math.round(confidence) };
       }
-
+      
+      // --- NN PREDICTION ---
       const input = tf.tensor2d([features]);
-      const output = trainedModel.tfModel.predict(input);
+      const output = activeModel.model.predict(input);
       const probs = output.dataSync();
       const idx = argMax(probs);
       const confidence = Math.round((probs[idx] || 0) * 100);
-
       input.dispose();
       output.dispose();
 
       return {
         className: trainedModel.labelMap[idx]?.name || "",
         confidence,
+        type 
       };
     },
     [trainedModel]
@@ -498,9 +581,9 @@ function Header() {
         <span style={{ ...styles.pill, ...(ready ? styles.pillSuccess : styles.pillMuted) }}>
           {ready ? "Trained model ready" : "Not trained"}
         </span>
-        <span style={styles.pillMuted}>{trainingStatus}</span>
+        <span style={{ ...styles.pill, ...styles.pillMuted }}>{trainingStatus}</span>
         {lastTrainSummary ? (
-          <span style={styles.pillMuted}>
+          <span style={{ ...styles.pill, ...styles.pillMuted }}>
             {lastTrainSummary.mode.toUpperCase()} · {lastTrainSummary.samples} samples
           </span>
         ) : null}
@@ -536,7 +619,9 @@ function SampleCard({ sample, onDelete }) {
           ✕
         </button>
       </div>
-      <div style={styles.sampleHint}>{sample.features?.length === 63 ? "63D vector" : "No features"}</div>
+      <div style={styles.sampleHint}>
+        {sample.features?.length === 63 ? "Hand (63D)" : sample.features?.length === 3 ? "Color (RGB)" : "No features"}
+      </div>
     </div>
   );
 }
@@ -569,6 +654,9 @@ function TrainingPage() {
     resetAll,
     handposeModelRef,
     setTrainingStatus,
+    // ✅ FIX: get cameraOn and setCameraOn from context
+    cameraOn,
+    setCameraOn,
   } = useApp();
 
   const [videoEl, setVideoEl] = useState(null);
@@ -593,7 +681,7 @@ function TrainingPage() {
     }
 
     forceRerender((n) => n + 1);
-  });
+  }, cameraOn); // ✅ FIX: pass cameraOn correctly
 
   const canCollect = !modelLoading && !modelError && handposeModelRef.current;
 
@@ -621,6 +709,19 @@ function TrainingPage() {
     });
 
     setTrainingStatus("Webcam sample added ✅");
+  };
+
+  // NEW: Collect color
+  const collectColor = async (classId) => {
+      if(!videoEl) return;
+      const features = extractAverageColor(videoEl);
+      // We reuse captureVideoFrame for the thumbnail, but we train on the extracted average color
+      const imageUrl = captureVideoFrame(videoEl);
+      
+      addSampleToClass(classId, {
+          id: uid(), source: "color", imageUrl, features, createdAt: Date.now()
+      });
+      setTrainingStatus("Color sample added ✅");
   };
 
   const handleUpload = async (event, classId) => {
@@ -683,10 +784,7 @@ function TrainingPage() {
             <h2 style={styles.panelTitle}>Class & Dataset Management</h2>
             <button
               onClick={addClass}
-              style={{
-                ...styles.primaryButton,
-                transform: "scale(1)",
-              }}
+              style={{ ...styles.primaryButton }}
               onMouseEnter={(e) => {
                 e.currentTarget.style.transform = "scale(1.05)";
                 e.currentTarget.style.boxShadow = "0 8px 24px rgba(102, 126, 234, 0.5)";
@@ -700,9 +798,33 @@ function TrainingPage() {
             </button>
           </div>
 
+          {/* ✅ Camera toggle row */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <span style={{ fontWeight: 600, color: "#0f172a" }}>Camera</span>
+            <button
+              onClick={() => setCameraOn((prev) => !prev)}
+              style={{
+                ...styles.primaryButton,
+                background: cameraOn
+                  ? "linear-gradient(135deg, #ef4444, #dc2626)"
+                  : "linear-gradient(135deg, #10b981, #059669)",
+                boxShadow: cameraOn
+                  ? "0 4px 14px rgba(239, 68, 68, 0.4)"
+                  : "0 4px 14px rgba(16, 185, 129, 0.4)",
+              }}
+            >
+              {cameraOn ? "Stop Camera" : "Start Camera"}
+            </button>
+          </div>
+
           <div style={styles.trainVideoWrap}>
             <video ref={setVideoEl} style={styles.trainVideo} muted playsInline autoPlay />
             <div style={styles.cameraOverlay}>{liveHandStateRef.current.label}</div>
+            {/* Center target for color sampling */}
+            <div style={{
+                position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+                width: 24, height: 24, border: '2px solid rgba(255,255,255,0.8)', borderRadius: 4, pointerEvents: 'none'
+            }} />
           </div>
 
           <div style={styles.classList}>
@@ -751,7 +873,11 @@ function TrainingPage() {
                 <div style={styles.collectRow}>
                   <button
                     onClick={() => collectFromWebcam(cls.id)}
-                    style={styles.secondaryButton}
+                    style={{ 
+                      ...styles.secondaryButton,
+                      opacity: canCollect ? 1 : 0.5,
+                      cursor: canCollect ? "pointer" : "not-allowed",
+                    }}
                     disabled={!canCollect}
                     onMouseEnter={(e) => {
                       if (canCollect) {
@@ -763,11 +889,22 @@ function TrainingPage() {
                       e.currentTarget.style.background = "#ffffff";
                       e.currentTarget.style.borderColor = "#e2e8f0";
                     }}
+                    title="Detect hand and add as sample"
                   >
-                    Capture Webcam
+                    Capture Hand
                   </button>
+                  <button
+                    onClick={() => collectColor(cls.id)}
+                    style={styles.secondaryButton}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = "#f8fafc"; e.currentTarget.style.borderColor = "#667eea"; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = "#ffffff"; e.currentTarget.style.borderColor = "#e2e8f0"; }}
+                    title="Capture center color as sample"
+                  >
+                    Capture Color
+                  </button>
+
                   <label
-                    style={styles.fileButton}
+                    style={styles.secondaryButton}
                     onMouseEnter={(e) => {
                       e.currentTarget.style.background = "#f8fafc";
                       e.currentTarget.style.borderColor = "#667eea";
@@ -1016,6 +1153,7 @@ function TestPage() {
 
   const { predict } = usePredictionEngine();
 
+  // ✅ FIX: TestPage always enables camera (true), no dependency on training cameraOn
   useHandTracking(videoEl, (predictions) => {
     if (predictions?.error) {
       setStatus(predictions.error);
@@ -1025,26 +1163,25 @@ function TestPage() {
     currentHandsRef.current = predictions || [];
     setCameraReady(true);
 
-    if (!trainedModel || trainedRevision !== datasetVersion) {
-      setPrediction("Model not trained for the latest dataset");
-      setConfidence(0);
-      setStatus("Training required");
-      return;
-    }
+    // Check for hand first
+    let hand = predictions?.[0];
+    
+    // If fallback logic is desired: "either hand detected, if not found use color"
+    // We pass landmarks if found, otherwise pass videoEl for color extraction
+    const result = predict(hand ? hand.landmarks : null, videoEl);
 
-    const hand = predictions?.[0];
-    if (!hand?.landmarks) {
-      setPrediction("No hand detected");
-      setConfidence(0);
-      setStatus("Move your hand into frame");
-      return;
+    if (!result.className) {
+        setPrediction(hand ? "Unknown Gesture" : "Unknown Color");
     }
-
-    const result = predict(hand.landmarks);
-    setPrediction(result.className || "Unknown");
+    
+    if (result.className) {
+        setPrediction(result.className);
+    }
+    
     setConfidence(result.confidence || 0);
-    setStatus(result.className ? "Prediction updated" : "Could not classify");
-  });
+    setStatus(hand ? "Hand Detected" : "Color Detection (Fallback)");
+
+  }, true); // ✅ always on for test page
 
   const ready = Boolean(trainedModel) && trainedRevision === datasetVersion;
   const sampleCount = classes.reduce((sum, cls) => sum + cls.samples.length, 0);
@@ -1606,11 +1743,6 @@ const styles = {
     background: "#ffffff",
     color: "#0f172a",
     boxShadow: "0 2px 8px rgba(0, 0, 0, 0.08)",
-  },
-
-  toggleInactive: {
-    background: "transparent",
-    color: "#64748b",
   },
 
   readyCard: {
